@@ -8,8 +8,11 @@
 <head>
 <meta charset="UTF-8">
 <!-- Seguridad: limita de dónde se cargan recursos y a dónde se conecta el juego.
-     Sin scripts externos; solo imágenes/fetch por https (Wikipedia, marcador). -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:; font-src 'self'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+     Sin scripts externos; solo los hosts EXACTOS que usa el juego:
+       img     → assets locales + fotos de Wikimedia (upload.wikimedia.org)
+       connect → marcador (Supabase) + API de Wikipedia (es/en)
+     Si cambia la URL de Supabase, actualizar también connect-src aquí. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://upload.wikimedia.org; connect-src 'self' https://vvjrksmyfrcluelimxyq.supabase.co https://es.wikipedia.org https://en.wikipedia.org; font-src 'self'; media-src 'none'; object-src 'none'; base-uri 'none'; form-action 'none'">
 <meta http-equiv="X-Content-Type-Options" content="nosniff">
 <meta name="referrer" content="no-referrer">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
@@ -49,7 +52,6 @@
     font-family:"Segoe UI",system-ui,Arial,sans-serif;
     display:flex;align-items:center;justify-content:center;
     min-height:100vh;min-height:100dvh;min-height:-webkit-fill-available;
-    padding:12px;
     overflow:hidden;
     touch-action:none;
     -webkit-user-select:none;user-select:none;
@@ -516,16 +518,47 @@ function applyI18n(){
 }
 
 const canvas = document.getElementById('game');
-const ctx = canvas.getContext('2d');
+// alpha:false — el juego pinta SIEMPRE el fondo completo, así que un lienzo
+// opaco permite al navegador componer más rápido (no mezcla con lo de atrás).
+// "let" y no "const": la caché de caras redirige temporalmente el dibujo a un
+// lienzo fuera de pantalla intercambiando esta referencia (ver cachedFace).
+let ctx = canvas.getContext('2d', { alpha:false });
 // Espacio de coordenadas lógico — toda la lógica usa estas medidas fijas.
 // El lienzo se escala según la densidad de píxeles del dispositivo para
 // verse nítido, mientras el CSS lo ajusta de forma responsiva a la pantalla.
 const W = 480, H = 600;
+
+// ---------- Caché de caras (rendimiento) ----------
+// Dibujar cada cara implica decenas de trazados y gradientes POR ENEMIGO y
+// POR CUADRO. Aquí cada cara se pinta UNA sola vez en un lienzo fuera de
+// pantalla y luego el cuadro solo hace un drawImage (mucho más barato).
+// La clave incluye el radio y si la foto ya cargó, para repintar cuando cambie.
+const faceCache = new Map();
+let cacheDpr = Math.min(window.devicePixelRatio || 1, 2);   // nitidez con memoria acotada
+function cachedFace(key, r, painter){
+  let c = faceCache.get(key);
+  if(!c){
+    c = document.createElement('canvas');
+    const s = Math.ceil(4*r*cacheDpr);   // margen 2r por lado: cubre camiseta, pelo e insignia
+    c.width = s; c.height = s;
+    const off = c.getContext('2d');
+    off.setTransform(cacheDpr, 0, 0, cacheDpr, 0, 0);
+    const prev = ctx; ctx = off;
+    try { painter(2*r, 2*r); } finally { ctx = prev; }
+    faceCache.set(key, c);
+  }
+  return c;
+}
+
 function fitCanvas(){
   const dpr = Math.min(window.devicePixelRatio || 1, 3);
   canvas.width  = Math.round(W * dpr);
   canvas.height = Math.round(H * dpr);
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  // si cambió la densidad (p. ej. mover la ventana a otro monitor),
+  // invalida la caché de caras para repintarlas con la nitidez nueva
+  const cd = Math.min(dpr, 2);
+  if(cd !== cacheDpr){ cacheDpr = cd; faceCache.clear(); }
 }
 fitCanvas();
 window.addEventListener('resize', fitCanvas);
@@ -829,6 +862,30 @@ const state = {
   heartT:0
 };
 
+// Filtra un arreglo EN SITIO (sin crear uno nuevo). Con 60 cuadros por segundo
+// y varios arreglos (balas, partículas, avisos), evitar un arreglo nuevo por
+// cuadro reduce mucho el trabajo del recolector de basura (menos microcortes).
+function compact(arr, keep){
+  let j = 0;
+  for(let i=0; i<arr.length; i++){ if(keep(arr[i])) arr[j++] = arr[i]; }
+  arr.length = j;
+  return arr;
+}
+
+// 📳 Vibración háptica (móvil): refuerza impactos y logros. Es opcional y
+// silenciosa donde no existe (iOS Safari no la soporta); se atenúa si el
+// usuario prefiere menos movimiento.
+function vibrate(pattern){
+  if(REDUCED_MOTION) return;
+  try{ if(navigator.vibrate) navigator.vibrate(pattern); }catch(e){}
+}
+
+// 📉 Calidad adaptativa: media móvil del tiempo por cuadro. Si el dispositivo
+// no alcanza ~40 fps, los efectos generan menos partículas para recuperar
+// fluidez (el juego se ve igual de bien y se siente mejor).
+let _dtEma = 0.016;
+function lowFx(){ return _dtEma > 0.026; }
+
 // ---------- Campo de estrellas (fondo) ----------
 function initStars(){
   state.stars = [];
@@ -854,7 +911,8 @@ function shade(hex, amt){
 
 // Dibuja el óvalo de la cara con un degradado radial que simula luz
 // (clara arriba-izquierda, sombra abajo-derecha) para dar volumen.
-function roundFace(x,y,r,skin){
+// Asume el contexto ya trasladado al centro del personaje.
+function roundFace(r,skin){
   const g=ctx.createRadialGradient(-r*0.3,-r*0.34,r*0.12, 0,0,r*1.3);
   g.addColorStop(0,    shade(skin, 0.22));
   g.addColorStop(0.55, skin);
@@ -909,7 +967,7 @@ function drawAbelardo(x,y,r){
   ctx.translate(x,y);
   drawJersey(r);
   // cara
-  roundFace(x,y,r,'#e8b48c');
+  roundFace(r,'#e8b48c');
   // pelo engominado oscuro hacia atrás
   ctx.fillStyle='#2a2118';
   ctx.beginPath();
@@ -944,7 +1002,7 @@ function drawRestrepo(x,y,r){
   ctx.translate(x,y);
   drawJersey(r);
   // cara
-  roundFace(x,y,r,'#e8b48c');
+  roundFace(r,'#e8b48c');
   // pelo corto canoso con entradas marcadas (calvicie frontal)
   ctx.fillStyle='#9aa0a8';
   ctx.beginPath(); ctx.ellipse(0,-r*0.62,r*0.72,r*0.3,0,Math.PI,0); ctx.fill();
@@ -973,7 +1031,8 @@ function drawRestrepo(x,y,r){
 }
 
 // Base común para los enemigos: hombros + óvalo de la cara
-function enemyBase(x,y,r,skin){
+// (asume el contexto ya trasladado al centro del personaje)
+function enemyBase(r,skin){
   // cuerpo/hombros con un leve degradado
   const g=ctx.createLinearGradient(0,r*0.6,0,r*1.8);
   g.addColorStop(0,'#2c3550'); g.addColorStop(1,'#1a2030');
@@ -984,13 +1043,13 @@ function enemyBase(x,y,r,skin){
   // cuello con sombra
   ctx.fillStyle=shade(skin,-0.18);
   ctx.beginPath(); ctx.ellipse(0,r*0.95,r*0.34,r*0.3,0,0,Math.PI*2); ctx.fill();
-  roundFace(x,y,r,skin);
+  roundFace(r,skin);
 }
 
 // --- Petro: calvo arriba, pelo lateral cano, sin barba ---
 function drawPetro(x,y,r){
   ctx.save(); ctx.translate(x,y);
-  enemyBase(x,y,r,'#d9a679');
+  enemyBase(r,'#d9a679');
   // pelo lateral/atrás canoso
   ctx.fillStyle='#9aa0a8';
   ctx.beginPath(); ctx.ellipse(-r*0.8,-r*0.1,r*0.3,r*0.5,0,0,7); ctx.fill();
@@ -1017,7 +1076,7 @@ function drawPetro(x,y,r){
 // --- Iván Cepeda: gafas, barba/bigote canoso, pelo cano ---
 function drawCepeda(x,y,r){
   ctx.save(); ctx.translate(x,y);
-  enemyBase(x,y,r,'#e0b389');
+  enemyBase(r,'#e0b389');
   // pelo cano
   ctx.fillStyle='#c9ccd2';
   ctx.beginPath(); ctx.ellipse(0,-r*0.55,r*0.95,r*0.55,0,Math.PI,0); ctx.fill();
@@ -1048,7 +1107,7 @@ function drawCepeda(x,y,r){
 // --- Roy Barreras: pelo cano peinado, gafas finas, semblante ---
 function drawRoy(x,y,r){
   ctx.save(); ctx.translate(x,y);
-  enemyBase(x,y,r,'#dcab80');
+  enemyBase(r,'#dcab80');
   // pelo gris peinado a un lado
   ctx.fillStyle='#b8bcc4';
   ctx.beginPath(); ctx.moveTo(-r*0.95,-r*0.2);
@@ -1079,7 +1138,7 @@ function drawRoy(x,y,r){
 // --- Gustavo Bolívar: pelo oscuro, barba candado oscura ---
 function drawBolivar(x,y,r){
   ctx.save(); ctx.translate(x,y);
-  enemyBase(x,y,r,'#dca97c');
+  enemyBase(r,'#dca97c');
   // pelo oscuro
   ctx.fillStyle='#3a2f26';
   ctx.beginPath(); ctx.ellipse(0,-r*0.55,r*0.95,r*0.58,0,Math.PI,0); ctx.fill();
@@ -1109,8 +1168,7 @@ function drawPizarro(x,y,r){
   // pelo largo detrás
   ctx.fillStyle='#2b211c';
   ctx.beginPath(); ctx.ellipse(0,r*0.2,r*1.15,r*1.25,0,0,Math.PI*2); ctx.fill();
-  enemyBase(x,y,r,'#e7bd93');
-  roundFace(x,y,r,'#e7bd93');
+  enemyBase(r,'#e7bd93');   // (ya incluye la cara)
   // flequillo
   ctx.fillStyle='#2b211c';
   ctx.beginPath(); ctx.moveTo(-r*0.95,-r*0.2);
@@ -1138,7 +1196,7 @@ function drawPizarro(x,y,r){
 // --- Francia Márquez: turbante de colores, piel oscura ---
 function drawFrancia(x,y,r){
   ctx.save(); ctx.translate(x,y);
-  enemyBase(x,y,r,'#7a4a2b');
+  enemyBase(r,'#7a4a2b');
   // turbante envolviendo la cabeza
   ctx.fillStyle='#e0982e';
   ctx.beginPath(); ctx.ellipse(0,-r*0.55,r*1.05,r*0.7,0,Math.PI,0); ctx.fill();
@@ -1180,7 +1238,7 @@ function drawQuilcue(x,y,r){
   ctx.fillStyle='#1c1410';
   ctx.beginPath(); ctx.ellipse(-r*0.85,r*0.55,r*0.22,r*0.7,0,0,7); ctx.fill();
   ctx.beginPath(); ctx.ellipse(r*0.85,r*0.55,r*0.22,r*0.7,0,0,7); ctx.fill();
-  enemyBase(x,y,r,'#c98a55');
+  enemyBase(r,'#c98a55');
   // sombrero tradicional (ala + copa)
   ctx.fillStyle='#3a2c1c';
   ctx.beginPath(); ctx.ellipse(0,-r*0.55,r*1.25,r*0.3,0,0,Math.PI*2); ctx.fill();
@@ -1209,7 +1267,7 @@ function drawQuilcue(x,y,r){
 // --- Armando Benedetti: cara redonda, calvo, ceño marcado ---
 function drawBenedetti(x,y,r){
   ctx.save(); ctx.translate(x,y);
-  enemyBase(x,y,r,'#d9a06f');
+  enemyBase(r,'#d9a06f');
   // poco pelo a los lados, entradas marcadas
   ctx.fillStyle='#3a2d22';
   ctx.beginPath(); ctx.ellipse(-r*0.78,-r*0.05,r*0.26,r*0.4,0,0,7); ctx.fill();
@@ -1242,8 +1300,7 @@ function drawSarabia(x,y,r){
   // melena lisa larga
   ctx.fillStyle='#4a3422';
   ctx.beginPath(); ctx.ellipse(0,r*0.25,r*1.05,r*1.2,0,0,Math.PI*2); ctx.fill();
-  enemyBase(x,y,r,'#ecc49a');
-  roundFace(x,y,r,'#ecc49a');
+  enemyBase(r,'#ecc49a');   // (ya incluye la cara)
   // pelo con raya al medio cayendo a los lados
   ctx.fillStyle='#4a3422';
   ctx.beginPath();
@@ -1280,8 +1337,7 @@ function drawGuerrero(x,y,r){
   ctx.fillStyle='#241a14';
   ctx.beginPath(); ctx.ellipse(0,-r*0.85,r*0.35,r*0.45,0,0,7); ctx.fill();
   ctx.beginPath(); ctx.ellipse(r*0.15,r*0.1,r*0.3,r*0.8,0.3,0,7); ctx.fill();
-  enemyBase(x,y,r,'#e3b485');
-  roundFace(x,y,r,'#e3b485');
+  enemyBase(r,'#e3b485');   // (ya incluye la cara)
   // pelo recogido hacia atrás (frente despejada con raya)
   ctx.fillStyle='#241a14';
   ctx.beginPath();
@@ -1426,10 +1482,19 @@ function drawSprite(sprite, x, y, r){
   ctx.beginPath(); ctx.arc(x,y,R,0,Math.PI*2); ctx.stroke();
   return true;
 }
-// Pinta un personaje: usa la foto si está lista, si no la ilustración
-function paintFace(sprite, drawFn, x, y, r){
+// Pinta la cara (foto si está lista, si no la ilustración) directamente en el
+// contexto actual. Solo la usa la caché al construir cada ficha.
+function paintFaceDirect(sprite, drawFn, x, y, r){
   if(sprite && sprite.ready && drawSprite(sprite, x, y, r)) return;
   drawFn(x, y, r);
+}
+// Pinta un personaje desde la caché (un solo drawImage por cuadro).
+// entity: { name, sprite, draw } — héroes y villanos comparten esta forma.
+function paintFace(entity, x, y, r){
+  const ready = !!(entity.sprite && entity.sprite.ready);
+  const c = cachedFace('h:'+entity.name+'|'+r+'|'+(ready?1:0), r,
+    (cx,cy)=> paintFaceDirect(entity.sprite, entity.draw, cx, cy, r));
+  ctx.drawImage(c, x-2*r, y-2*r, 4*r, 4*r);
 }
 
 // Distintivo de villano: una calavera en una insignia, en la esquina
@@ -1470,10 +1535,14 @@ function drawSkullBadge(x, y, r){
   ctx.restore();
 }
 
-// Pinta un enemigo (cara + distintivo de calavera de villano)
+// Pinta un enemigo (cara + distintivo de calavera de villano) desde la caché
 function paintEnemy(type, x, y, r){
-  paintFace(type.sprite, type.draw, x, y, r);
-  drawSkullBadge(x, y, r);
+  const ready = !!(type.sprite && type.sprite.ready);
+  const c = cachedFace('v:'+type.name+'|'+r+'|'+(ready?1:0), r, (cx,cy)=>{
+    paintFaceDirect(type.sprite, type.draw, cx, cy, r);
+    drawSkullBadge(cx, cy, r);
+  });
+  ctx.drawImage(c, x-2*r, y-2*r, 4*r, 4*r);
 }
 
 // ========================================================
@@ -1561,6 +1630,9 @@ function buildWave(level, announce){
 // ========================================================
 // --- Teclado (escritorio) ---
 window.addEventListener('keydown', e=>{
+  // Si el foco está en un campo de texto (p. ej. el nombre), no interceptar:
+  // permite escribir espacios y mover el cursor con las flechas.
+  if(e.target && (e.target.tagName==='INPUT' || e.target.tagName==='TEXTAREA')) return;
   if(['ArrowLeft','ArrowRight','ArrowUp','ArrowDown',' '].includes(e.key)) e.preventDefault();
   state.keys[e.key]=true;
   if(e.key===' ') tryFire();
@@ -1652,17 +1724,20 @@ function unlockAudio(){
   }
 }
 // Tono simple (efectos cortos). type: 'square','triangle','sine','sawtooth'
-function tone(freq,dur,vol,type){
+// "when" (opcional): momento exacto en el reloj de WebAudio en que debe sonar;
+// permite a la música programarse por adelantado con precisión de muestra.
+function tone(freq,dur,vol,type,when){
   if(!audio.on) return;
   const c=getCtx(); if(!c) return;
   try{
+    const t0 = (when!=null) ? when : c.currentTime;
     const o=c.createOscillator(), g=c.createGain();
     o.type=type||'square'; o.frequency.value=freq;
-    g.gain.value=vol||0.05;
+    g.gain.setValueAtTime(vol||0.05, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0+dur);
     o.connect(g); g.connect(audio.master);
-    o.start();
-    g.gain.exponentialRampToValueAtTime(0.001, c.currentTime+dur);
-    o.stop(c.currentTime+dur);
+    o.start(t0);
+    o.stop(t0+dur);
   }catch(e){}
 }
 // Compatibilidad con las llamadas existentes
@@ -1811,21 +1886,32 @@ function musicMood(){
     bass: (w % 3 === 2) ? 'square' : 'sine'                    // bajo más marcado a ratos
   };
 }
+// Secuenciador con "lookahead": un intervalo corto revisa el reloj de WebAudio
+// y programa por adelantado las notas que caen dentro de la ventana. Así el
+// tempo es exacto aunque el hilo principal esté ocupado dibujando (el patrón
+// clásico "A Tale of Two Clocks" para música procedimental en el navegador).
+const MUSIC_LOOKAHEAD = 0.12;   // ventana de programación (s)
 function startMusic(){
   stopMusic();
   if(!audio.on || !getCtx()) return;
   audio.step = 0;
   audio.world = worldIdx();
-  audio.musicTimer = setInterval(musicTick, musicMs());
+  audio.nextNote = audio.ctx.currentTime + 0.06;
+  audio.musicTimer = setInterval(musicTick, 25);
 }
 function musicTick(){
-  if(!audio.on || !state.running || state.paused) return;
+  const c = audio.ctx;
+  if(!audio.on || !c) return;
+  if(!state.running || state.paused){ audio.nextNote = c.currentTime + 0.06; return; }
   // ¿cambió de mundo? reprograma el tempo y el tono nuevos
   if(worldIdx() !== audio.world){ startMusic(); return; }
-  const s = audio.step++;
-  const m = musicMood();
-  tone(MUSIC_ARP[s % MUSIC_ARP.length] * m.tr, 0.16, 0.022, m.arp);   // arpegio
-  if(s % 4 === 0) tone(MUSIC_BASS[(s/4) % MUSIC_BASS.length] * m.tr, 0.34, 0.05, m.bass); // bajo
+  const beat = musicMs()/1000, m = musicMood();
+  while(audio.nextNote < c.currentTime + MUSIC_LOOKAHEAD){
+    const s = audio.step++, t = audio.nextNote;
+    tone(MUSIC_ARP[s % MUSIC_ARP.length] * m.tr, 0.16, 0.022, m.arp, t);   // arpegio
+    if(s % 4 === 0) tone(MUSIC_BASS[(s/4) % MUSIC_BASS.length] * m.tr, 0.34, 0.05, m.bass, t); // bajo
+    audio.nextNote += beat;
+  }
 }
 function stopMusic(){ if(audio.musicTimer){ clearInterval(audio.musicTimer); audio.musicTimer=null; } }
 // Silenciar / reactivar el sonido
@@ -1852,7 +1938,7 @@ function startGame(name){
   state.bullets=[]; state.enemyBullets=[]; state.particles=[];
   state.powerups=[]; state.boss=null; state.worlds=0; state.nextWaveDelay=0; state.advancing=false;
   state.popups=[]; state.banner=null; state.shakeT=0; state.shakeMag=0;
-  state.combo=0; state.comboTimer=0; state.flashT=0; state.bonus=null;
+  state.combo=0; state.comboTimer=0; state.flashT=0; state.bonus=null; state.heartT=0;
   state.player = createPlayer();
   // Arranque más fuerte: arma nivel 2 (disparo doble) y escudo de cortesía
   state.player.weapon = 2;
@@ -1967,6 +2053,7 @@ function loop(now){
   let dt = (now - state.lastTime)/1000;
   if(dt>0.05) dt=0.05;   // limita el salto tras pausas o pestañas inactivas
   state.lastTime = now;
+  _dtEma += (dt - _dtEma)*0.05;   // media móvil para la calidad adaptativa
   update(dt);
   render();
   requestAnimationFrame(loop);
@@ -2090,9 +2177,9 @@ function update(dt){
   // nave bonus
   updateBonus(dt);
 
-  // disparos enemigos (algunos llevan también velocidad horizontal)
+  // disparos enemigos (algunos llevan también velocidad horizontal); los que
+  // salen de pantalla se descartan en una única compactación tras las colisiones
   for(const b of state.enemyBullets){ b.x += (b.vx||0)*dt; b.y += b.vy*dt; }
-  state.enemyBullets = state.enemyBullets.filter(b=> b.y < H+10 && b.x > -30 && b.x < W+30);
 
   // colisiones: disparos del jugador contra enemigos
   for(const b of state.bullets){
@@ -2154,9 +2241,9 @@ function update(dt){
       }
     }
   }
-  // un solo filtrado por cuadro: quita los disparos que salieron por arriba o
-  // ya impactaron (marcados con y=-999), evitando crear varios arreglos.
-  state.bullets = state.bullets.filter(b=> b.y > -10);
+  // una sola compactación por cuadro: quita los disparos que salieron por
+  // arriba o ya impactaron (marcados con y=-999), sin crear arreglos nuevos.
+  compact(state.bullets, b=> b.y > -10);
 
   // colisiones contra el jugador (el escudo o la invulnerabilidad lo protegen)
   if(!isProtected()){
@@ -2181,7 +2268,7 @@ function update(dt){
       if(dx*dx+dy*dy < (state.boss.r*0.8+p.r)*(state.boss.r*0.8+p.r)) hitPlayer();
     }
   }
-  state.enemyBullets = state.enemyBullets.filter(b=> b.y < H+10 && b.x > -30 && b.x < W+30);
+  compact(state.enemyBullets, b=> b.y < H+10 && b.x > -30 && b.x < W+30);
 
   // power-ups que caen: mover, recoger y descartar los que salen de pantalla
   for(const pu of state.powerups){
@@ -2189,17 +2276,17 @@ function update(dt){
     const dx=pu.x-p.x, dy=pu.y-p.y;
     if(dx*dx+dy*dy < (pu.r+p.r)*(pu.r+p.r)){ pu.dead=true; applyPowerup(pu); }
   }
-  state.powerups = state.powerups.filter(pu=> !pu.dead && pu.y < H+20);
+  compact(state.powerups, pu=> !pu.dead && pu.y < H+20);
 
   // partículas
   for(const pt of state.particles){
     pt.x+=pt.vx*dt; pt.y+=pt.vy*dt; pt.life-=dt; pt.vy+=120*dt;
   }
-  state.particles = state.particles.filter(pt=> pt.life>0);
+  compact(state.particles, pt=> pt.life>0);
 
   // puntajes flotantes / tigres, cartel y sacudida de pantalla
   for(const pop of state.popups){ pop.y += (pop.vy!=null ? pop.vy : -28)*dt; pop.t -= dt; }
-  state.popups = state.popups.filter(pop=> pop.t>0);
+  compact(state.popups, pop=> pop.t>0);
   if(state.banner){ state.banner.t -= dt; if(state.banner.t<=0) state.banner=null; }
   if(state.shakeT>0){ state.shakeT -= dt; if(state.shakeT<=0) state.shakeMag=0; }
   if(state.flashT>0){ state.flashT -= dt; }
@@ -2313,6 +2400,7 @@ function defeatBoss(){
   addShake(12, 0.6);
   addFlash('#ffd100', 0.45);
   sfxBossDie();
+  vibrate([40,60,120]);   // 📳 jefe derrotado
   setTimeout(sfxWhine, 220);   // 😼 quejido gracioso del villano derrotado
   state.boss=null;
   // ¿Era el ÚLTIMO villano (Gustavo Petro)? Entonces se gana el juego.
@@ -2345,6 +2433,7 @@ function winGame(){
   lockOverlay(winScreen, 1200);   // que el toque que sigue presionado no lo salte
   // celebración sonora: fanfarria + rugido doble triunfal del Tigre 🐯
   sfxFanfare();
+  vibrate([60,80,60,80,180]);   // 📳 ¡victoria!
   setTimeout(sfxFanfare, 700);
   setTimeout(()=>sfxRoar({base:110, dur:1.0, vol:0.26}), 300);
   setTimeout(()=>sfxRoar({base:85,  dur:1.3, vol:0.28, growl:26}), 1200);
@@ -2404,6 +2493,7 @@ function applyPowerup(pu){
   else if(pu.type==='life')   state.lives = Math.min(9, state.lives+1);
   else if(pu.type==='bomb')   detonateBomb();
   sfxPowerup();
+  vibrate(18);            // 📳 toque sutil al recoger
   updateHUD();
 }
 // ⭐ Nave BONUS: cruza la parte de arriba; derríbala para puntos extra
@@ -2436,6 +2526,7 @@ function drawBonus(){
 // 💣 Bomba: limpia las balas enemigas y arrasa con lo que haya en pantalla
 function detonateBomb(){
   addFlash('#fff', 0.6); addShake(12, 0.5); sfxExplosion();
+  vibrate([30,40,30,40,90]);   // 📳 onda expansiva
   showBanner('💣 ¡BOMBA! 💥', '#ffd100', 28, 1.0);
   state.enemyBullets = [];
   for(const e of state.enemies){
@@ -2478,8 +2569,9 @@ function hitPlayer(){
   addShake(9, 0.4);
   addFlash('#ff4d6d', 0.35);
   sfxHit();
+  vibrate(70);            // 📳 golpe al jugador
   updateHUD();
-  if(state.lives<=0){ endGame(false); }
+  if(state.lives<=0){ endGame(); }
   else {
     state.invuln = 1.5;
     state.player.x = W/2;
@@ -2489,11 +2581,12 @@ function hitPlayer(){
 
 function loseAll(){
   spawnExplosion(state.player.x, state.player.y, '#ff4d6d', 24);
-  endGame(false);
+  endGame();
 }
 
 function spawnExplosion(x,y,color,n){
   n = n||16;
+  if(lowFx()) n = Math.ceil(n*0.5);   // dispositivo lento: menos partículas
   for(let i=0;i<n;i++){
     const a=Math.random()*Math.PI*2, sp=Math.random()*180+40;
     state.particles.push({ x,y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp,
@@ -2502,7 +2595,8 @@ function spawnExplosion(x,y,color,n){
 }
 // Chispas brillantes y breves al impactar un disparo
 function spawnSparks(x,y,color){
-  for(let i=0;i<6;i++){
+  const n = lowFx() ? 3 : 6;
+  for(let i=0;i<n;i++){
     const a=Math.random()*Math.PI*2, sp=Math.random()*220+60;
     state.particles.push({ x,y, vx:Math.cos(a)*sp, vy:Math.sin(a)*sp - 40,
       life:0.18+Math.random()*0.18, color:color||'#fff', r:Math.random()*2+1 });
@@ -2535,8 +2629,8 @@ function lockOverlay(el, ms){
 // Color de ambiente según el mundo actual (cambia cada 5 niveles)
 function worldHue(){ return (Math.floor((state.level-1)/5) * 47) % 360; }
 
-// Termina la partida, guarda el puntaje y muestra el Top 5
-function endGame(won){
+// Termina la partida (derrota), guarda el puntaje y muestra el ranking
+function endGame(){
   state.running = false;
   state.paused = false;
   stopMusic();
@@ -2575,7 +2669,7 @@ function endGame(won){
 // ========================================================
 let _bgHue = -1, _bgGrad = null;   // gradiente de fondo cacheado por mundo
 function render(){
-  ctx.clearRect(0,0,W,H);
+  // no hace falta clearRect: el degradado de fondo cubre todo el lienzo
   // fondo con color de ambiente según el mundo (se recalcula solo al cambiar)
   const hue = worldHue();
   if(hue !== _bgHue || !_bgGrad){
@@ -2651,7 +2745,7 @@ function render(){
   if(state.player && state.lives>0){
     const pl=state.player;
     const blink = state.invuln>0 && Math.floor(state.invuln*12)%2===0;
-    if(!blink){ const hero=currentHero(); paintFace(hero.sprite, hero.draw, pl.x, pl.y, pl.r); }
+    if(!blink){ paintFace(currentHero(), pl.x, pl.y, pl.r); }
     // pequeña llama del propulsor
     if(!blink){
       ctx.fillStyle='rgba(127,255,212,'+(0.4+Math.random()*0.3)+')';
@@ -2751,7 +2845,8 @@ function render(){
 function idleAnim(now){
   if(state.running) return;
   if(!state.stars.length) initStars();
-  ctx.clearRect(0,0,W,H);
+  // el lienzo es opaco (alpha:false): pinta el fondo en lugar de "borrar"
+  ctx.fillStyle='#02030a'; ctx.fillRect(0,0,W,H);
   ctx.fillStyle='#fff';
   for(const s of state.stars){
     s.y += s.v*0.016; if(s.y>H){ s.y=0; s.x=Math.random()*W; }
@@ -2763,7 +2858,7 @@ function idleAnim(now){
   const t = now/1000;
   // alterna los dos protagonistas en el menú
   const hero = HEROES[Math.floor(t/2) % HEROES.length];
-  paintFace(hero.sprite, hero.draw, W/2, H-90 + Math.sin(t)*6, 26);
+  paintFace(hero, W/2, H-90 + Math.sin(t)*6, 26);
   paintEnemy(ENEMY_TYPES[0], 90+Math.sin(t*0.7)*18, 100, 21);
   paintEnemy(ENEMY_TYPES[1], W-90+Math.cos(t*0.6)*18, 120, 21);
   paintEnemy(ENEMY_TYPES[2], W/2-70+Math.sin(t*0.8)*16, 80, 19);
